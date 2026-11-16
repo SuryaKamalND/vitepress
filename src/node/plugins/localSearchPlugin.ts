@@ -101,6 +101,27 @@ export async function localSearchPlugin(
     return index
   }
 
+  // ids added for each page, keyed by its source path — a removed page can't
+  // be re-rendered and its rewrite may already be gone, so this is the only
+  // way to find what to discard once the file no longer exists (#5481)
+  const indexedPages = new Map<string, { locale: string; ids: Set<string> }>()
+
+  function discardPage(page: string) {
+    const entry = indexedPages.get(page)
+    if (!entry) return false
+    indexedPages.delete(page)
+    const index = indexByLocales.get(entry.locale)
+    if (!index) return false
+    let changed = false
+    for (const id of entry.ids) {
+      if (index.has(id)) {
+        index.discard(id)
+        changed = true
+      }
+    }
+    return changed
+  }
+
   let server: ViteDevServer | undefined
   let pending: Promise<void>
 
@@ -169,11 +190,17 @@ export async function localSearchPlugin(
       (await options.miniSearch?._splitIntoSections?.(file, html)) ??
       // default implementation
       splitPageIntoSections(html)
+    let indexed = indexedPages.get(page)
+    if (!indexed || indexed.locale !== locale) {
+      indexed = { locale, ids: new Set() }
+      indexedPages.set(page, indexed)
+    }
     // add sections to the locale index
     for await (const section of sections) {
       if (!section || !(section.text || section.titles)) break
       const { anchor, text, titles } = section
       const id = anchor ? [fileId, anchor].join('#') : fileId
+      indexed.ids.add(id)
       index.has(id) && index.discard(id)
       index.add({
         id,
@@ -266,11 +293,20 @@ export async function localSearchPlugin(
       }
     },
 
-    async hotUpdate({ file }) {
+    async hotUpdate({ file, type }) {
       if (this.environment.name !== 'client') return
 
       if (file.endsWith('.md')) {
         const page = slash(path.relative(siteConfig.srcDir, file))
+        // a deleted (or renamed-away) page is no longer in siteConfig.pages,
+        // so drop what was indexed for it instead of trying to re-index
+        if (type === 'delete') {
+          if (discardPage(page)) {
+            debug('🗑️ Removed', file)
+            onIndexUpdated()
+          }
+          return
+        }
         // only index actual pages, not includes or route templates
         if (siteConfig.pages.includes(page)) {
           await indexFile(page)
