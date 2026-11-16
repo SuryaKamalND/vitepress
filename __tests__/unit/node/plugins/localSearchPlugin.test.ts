@@ -1,4 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -307,6 +314,132 @@ describe('node/plugins/localSearchPlugin', () => {
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('Failed to index broken.md for search')
     )
+  })
+
+  describe('dev: pages removed while the server runs (#5481)', () => {
+    beforeEach(() => {
+      // dev mode: `load` serves the live index instead of re-scanning, so only
+      // hotUpdate can change it between two reads
+      process.env.NODE_ENV = 'development'
+    })
+
+    async function setup(files: Record<string, string>, config = '') {
+      root = await mkdtemp(path.join(tmpdir(), 'vitepress-local-search-'))
+      for (const [file, content] of Object.entries(files)) {
+        await mkdir(path.dirname(path.join(root, file)), { recursive: true })
+        await writeFile(path.join(root, file), content)
+      }
+      await mkdir(path.join(root, '.vitepress'), { recursive: true })
+      await writeFile(
+        path.join(root, '.vitepress', 'config.mjs'),
+        `export default { ${config} themeConfig: { search: { provider: 'local' } } }`
+      )
+
+      const siteConfig = await resolveConfig(root, 'serve', 'development')
+      const plugin = await localSearchPlugin(siteConfig)
+      await (plugin.configResolved as any)?.call(
+        {},
+        { publicDir: siteConfig.publicDir }
+      )
+
+      const server = {
+        moduleGraph: {
+          onFileChange: vi.fn(),
+          getModuleById: vi.fn(() => ({ url: '/@localSearchIndex' }))
+        },
+        ws: { send: vi.fn() }
+      }
+      ;(plugin.configureServer as any).call({}, server)
+      await (plugin.load as any).handler.call({}, '/@localSearchIndex')
+      server.ws.send.mockClear()
+
+      const hotUpdate = (file: string, type: 'create' | 'update' | 'delete') =>
+        (plugin.hotUpdate as any).call(
+          { environment: { name: 'client' } },
+          { file: path.join(root!, file), type }
+        )
+      const getIndex = async (locale = 'root') =>
+        loadIndex(
+          (await (plugin.load as any).handler.call(
+            {},
+            `/@localSearchIndex${locale}`
+          )) as string
+        )
+
+      return { root, siteConfig, server, hotUpdate, getIndex }
+    }
+
+    test('discards every section of a deleted page', async () => {
+      const { root, server, hotUpdate, getIndex } = await setup({
+        'index.md': '# Home\n\nkeeptoken\n',
+        'guide/old.md': '# Old\n\ngonetoken\n\n## Sub\n\ngonetoken again\n'
+      })
+      expect((await getIndex()).search('gonetoken')).toHaveLength(2)
+
+      await rm(path.join(root, 'guide/old.md'))
+      await hotUpdate('guide/old.md', 'delete')
+
+      const index = await getIndex()
+      expect(index.search('gonetoken')).toEqual([])
+      expect(index.search('keeptoken')).toHaveLength(1)
+      // the client must be told to fetch the new index
+      expect(server.ws.send).toHaveBeenCalledTimes(1)
+    })
+
+    test('keeps only the new path after a rename', async () => {
+      const { root, siteConfig, hotUpdate, getIndex } = await setup({
+        'guide/old.md': '# Moved\n\nmovedtoken\n'
+      })
+
+      // a rename reaches vite as a delete followed by a create
+      await rename(
+        path.join(root, 'guide/old.md'),
+        path.join(root, 'guide/new.md')
+      )
+      siteConfig.pages = ['guide/new.md']
+      await hotUpdate('guide/old.md', 'delete')
+      await hotUpdate('guide/new.md', 'create')
+
+      expect((await getIndex()).search('movedtoken')).toMatchObject([
+        { id: '/guide/new.html#moved' }
+      ])
+    })
+
+    test('discards from the right locale index when rewrites apply', async () => {
+      const { root, hotUpdate, getIndex } = await setup(
+        {
+          'index.md': '# Home\n\nroottoken\n',
+          'src/zh.md': '# Zh\n\nzhtoken\n'
+        },
+        `rewrites: { 'src/zh.md': 'zh/guide.md' },
+         locales: { root: { label: 'English' }, zh: { label: 'Chinese' } },`
+      )
+      expect((await getIndex('zh')).search('zhtoken')).toMatchObject([
+        { id: '/zh/guide.html#zh' }
+      ])
+
+      await rm(path.join(root, 'src/zh.md'))
+      await hotUpdate('src/zh.md', 'delete')
+
+      expect((await getIndex('zh')).search('zhtoken')).toEqual([])
+      expect((await getIndex()).search('roottoken')).toHaveLength(1)
+    })
+
+    test('ignores deleted files that were never indexed', async () => {
+      const { root, server, hotUpdate, getIndex } = await setup(
+        {
+          'index.md': '# Home\n\nkeeptoken\n',
+          'parts/snippet.md': 'snippettoken\n'
+        },
+        `srcExclude: ['parts/**'],`
+      )
+
+      await rm(path.join(root, 'parts/snippet.md'))
+      await hotUpdate('parts/snippet.md', 'delete')
+
+      expect(server.ws.send).not.toHaveBeenCalled()
+      expect((await getIndex()).search('keeptoken')).toHaveLength(1)
+    })
   })
 })
 
